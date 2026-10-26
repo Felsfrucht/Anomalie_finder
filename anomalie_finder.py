@@ -55,7 +55,8 @@ Rauschen markiert wird, den Regler etwas zurücknehmen.
 
 WIEDERHOLUNGSFILTER
 Viele gleichartige Funde (z. B. Tausende Sterne) gelten als normal und werden ausgeblendet.
-Etwas Einzelnes, das heraussticht, bleibt. Mit "Gruppengröße" legst du fest, ab wie vielen
+Etwas Einzelnes, das heraussticht, bleibt. Die Gruppen werden immer bei höchster Empfindlichkeit gezählt:
+Mehr Empfindlichkeit zeigt also nie weniger Funde, Rahmen können nur zusammenwachsen. Mit "Gruppengröße" legst du fest, ab wie vielen
 ähnlichen Funden etwas als normal gilt.
 
 EINZELNE PIXEL

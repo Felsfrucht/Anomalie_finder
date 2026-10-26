@@ -77,6 +77,8 @@ T_MAX = 40.0
 T_MIN = 3.0
 # Totzone: z-Werte bis hierhin zählen als normale Schwankung / Rauschen.
 DEADBAND = 2.0
+# Wiederholungsfilter: so ähnlich (in Merkmals-Einheiten) müssen zwei Regionen sein, um als "gleichartig" zu gelten.
+REPEAT_TOL = 1.0
 
 
 @dataclass
@@ -364,8 +366,8 @@ def _kth_dist_numpy(ref: np.ndarray, Q: np.ndarray, kk: int) -> np.ndarray:
     return out
 
 
-def _count_within(feat: np.ndarray) -> np.ndarray:
-    """Pro Zeile: Anzahl Zeilen (inkl. sich selbst) mit Abstand <= 1 in jeder Dimension."""
+def _count_within(feat: np.ndarray, tol: float = 1.0) -> np.ndarray:
+    """Pro Zeile: Anzahl Zeilen (inkl. sich selbst) mit Abstand <= tol in jeder Dimension."""
     n = len(feat)
     order = np.argsort(feat[:, 0])
     f = feat[order]
@@ -374,10 +376,10 @@ def _count_within(feat: np.ndarray) -> np.ndarray:
     step = 256
     for i in range(0, n, step):
         j = min(n, i + step)
-        lo = np.searchsorted(f0, f0[i] - 1.0, side="left")
-        hi = np.searchsorted(f0, f0[j - 1] + 1.0, side="right")
+        lo = np.searchsorted(f0, f0[i] - tol, side="left")
+        hi = np.searchsorted(f0, f0[j - 1] + tol, side="right")
         cand = f[lo:hi]
-        close = (np.abs(f[i:j, None, :] - cand[None, :, :]).max(axis=2) <= 1.0)
+        close = (np.abs(f[i:j, None, :] - cand[None, :, :]).max(axis=2) <= tol)
         counts[order[i:j]] = close.sum(axis=1)
     return counts
 
@@ -453,6 +455,7 @@ class AnalysisResult:
     z_struct: np.ndarray
     params: AnalysisParams
     timings: dict = field(default_factory=dict)
+    cache: dict = field(default_factory=dict, repr=False)   # Zwischenspeicher der Erkennung
 
 
 def analyze(image: Image.Image, params: Optional[AnalysisParams] = None,
@@ -579,19 +582,33 @@ def _fill_small_holes(mask: np.ndarray, max_area: int) -> np.ndarray:
     return mask | fill[bg]
 
 
-def detect(res: AnalysisResult, p: Optional[DetectParams] = None) -> Detection:
-    p = p or DetectParams()
+@dataclass
+class _Seg:
+    """Zwischenergebnis: zusammengefasste Treffer oberhalb einer Schwelle."""
+    score: np.ndarray
+    lab: np.ndarray            # Region-Nummern 1..n (0 = nichts)
+    n: int
+    n_small: int
+    area: np.ndarray
+    peak: np.ndarray
+    mean: np.ndarray
+    peak_pos: np.ndarray       # (n, 2) Zeile, Spalte des Spitzenwerts
+    com: np.ndarray
+    objs: list
+    shares: np.ndarray         # (n, 3) mittlere z-Werte Farbe/Folge/Struktur im Kern
+    rgbm: np.ndarray
+    feat: np.ndarray           # Merkmale für den Wiederholungsfilter
+
+
+def _segment(res: AnalysisResult, p: DetectParams, T: float, min_area: int) -> Optional[_Seg]:
     H, W = res.shape
     zc = np.maximum(res.z_color - DEADBAND, 0) * p.w_color
     zs = np.maximum(res.z_seq - DEADBAND, 0) * p.w_seq
     zt = np.maximum(res.z_struct - DEADBAND, 0) * p.w_struct
     score = np.sqrt(zc * zc + zs * zs + zt * zt).astype(np.float32)
-    T = threshold_from_sensitivity(p.sensitivity)
-
-    empty = Detection([], np.zeros((H, W), np.int32), score, T, res.scale, res.orig_size)
     mask = score >= T
     if not mask.any():
-        return empty
+        return _Seg(score, np.zeros((H, W), np.int32), 0, 0, *(None,) * 9)
 
     # Nahe Treffer verschmelzen (Schließen), kleine Löcher füllen
     if p.merge_px > 0:
@@ -603,15 +620,12 @@ def detect(res: AnalysisResult, p: Optional[DetectParams] = None) -> Detection:
     mask = _fill_small_holes(mask, p.hole_px)
 
     lab_img, n = ndi.label(mask, structure=np.ones((3, 3), int))
-    if n == 0:
-        return empty
     areas = np.bincount(lab_img.ravel(), minlength=n + 1)
-    keep = areas >= max(1, p.min_area)
+    keep = areas >= max(1, min_area)
     keep[0] = False
     n_small = int(((areas > 0) & ~keep).sum() - 1)
     if not keep.any():
-        empty.n_small = max(n_small, 0)
-        return empty
+        return _Seg(score, np.zeros((H, W), np.int32), 0, max(n_small, 0), *(None,) * 9)
     remap = np.zeros(n + 1, np.int32)
     remap[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.int32)
     lab_img = remap[lab_img]
@@ -621,71 +635,101 @@ def detect(res: AnalysisResult, p: Optional[DetectParams] = None) -> Detection:
     area = np.bincount(lab_img.ravel(), minlength=n + 1)[1:]
     peak = np.asarray(ndi.maximum(score, lab_img, idx))
     mean = np.asarray(ndi.mean(score, lab_img, idx))
+    peak_pos = np.asarray(ndi.maximum_position(score, lab_img, idx)).reshape(n, 2)
     com = np.asarray(ndi.center_of_mass(np.ones((H, W), np.float32), lab_img, idx)).reshape(n, 2)
     objs = ndi.find_objects(lab_img)
 
     # Kern jeder Region: Pixel mit mindestens dem halben Spitzenwert. Der Kern beschreibt die
-    # Auffälligkeit selbst. Der Rand (Hof, verschmolzene Nachbarschaft) würde sonst Farbe und
-    # Größe verfälschen, vor allem bei hoher Empfindlichkeit.
+    # Auffälligkeit selbst; Hof und verschmolzene Nachbarschaft würden Farbe und Größe verfälschen.
     peak_px = np.concatenate([[0.0], peak]).astype(np.float32)[lab_img]
     core_lab = np.where((lab_img > 0) & (score >= 0.5 * peak_px), lab_img, 0)
     core_area = np.bincount(core_lab.ravel(), minlength=n + 1)[1:]
     core_objs = ndi.find_objects(core_lab, max_label=n)
-    mc = np.asarray(ndi.mean(zc, core_lab, idx))
-    ms = np.asarray(ndi.mean(zs, core_lab, idx))
-    mt = np.asarray(ndi.mean(zt, core_lab, idx))
+    shares = np.stack([np.asarray(ndi.mean(z, core_lab, idx)) for z in (zc, zs, zt)], axis=1)
     rgbm = np.stack([np.asarray(ndi.mean(res.rgb[..., c], core_lab, idx)) for c in range(3)], axis=1)
     cw = np.array([o[1].stop - o[1].start for o in core_objs], float)
     ch = np.array([o[0].stop - o[0].start for o in core_objs], float)
+    labm = rgb_to_lab(np.clip(rgbm, 0, 255).astype(np.uint8).reshape(n, 1, 3)).reshape(n, 3)
+    feat = np.column_stack([
+        np.log2(np.maximum(core_area, 1)),
+        np.log2(cw / np.maximum(ch, 1)),
+        labm[:, 0] / 18.0, labm[:, 1] / 18.0, labm[:, 2] / 18.0,
+        (core_area / np.maximum(cw * ch, 1)) / 0.35,
+    ])
+    return _Seg(score, lab_img, n, max(n_small, 0), area, peak, mean, peak_pos, com, objs, shares, rgbm, feat)
 
-    # Wiederholungsfilter: viele gleichartige Regionen (Größe, Form, Farbe des Kerns) = normal
-    repeated = np.zeros(n, bool)
-    if p.repeat_filter and n > p.repeat_group:
-        labm = rgb_to_lab(np.clip(rgbm, 0, 255).astype(np.uint8).reshape(n, 1, 3)).reshape(n, 3)
-        feat = np.column_stack([
-            np.log2(np.maximum(core_area, 1)),
-            np.log2(cw / np.maximum(ch, 1)),
-            labm[:, 0] / 18.0, labm[:, 1] / 18.0, labm[:, 2] / 18.0,
-            (core_area / np.maximum(cw * ch, 1)) / 0.35,
-        ])
+
+def _repeat_map(res: AnalysisResult, p: DetectParams) -> Optional[np.ndarray]:
+    """
+    Pixelkarte (bool): liegt das Pixel in einer Region, die zu vielen gleichartigen gehört?
+
+    Die Gruppen werden immer bei der höchsten Empfindlichkeit gezählt, nicht bei der gerade
+    eingestellten. Sonst würde ein Fund verschwinden, sobald man den Regler weiter aufdreht
+    und dadurch mehr ähnliche Funde entstehen. So gilt: höhere Empfindlichkeit zeigt nie
+    weniger. Das Ergebnis wird je Analyse zwischengespeichert.
+    """
+    key = (p.w_color, p.w_seq, p.w_struct, p.merge_px, p.hole_px, p.repeat_group)
+    cache = res.cache
+    if key in cache:
+        return cache[key]
+    seg = _segment(res, p, threshold_from_sensitivity(100.0), min_area=1)
+    out = None
+    if seg.n > p.repeat_group:
         if cKDTree is not None:
-            neigh = cKDTree(feat).query_ball_point(feat, r=1.0, p=np.inf, return_length=True)
+            neigh = cKDTree(seg.feat).query_ball_point(seg.feat, r=REPEAT_TOL, p=np.inf, return_length=True)
         else:
-            neigh = _count_within(feat)
-        repeated = (np.asarray(neigh) - 1) >= p.repeat_group
+            neigh = _count_within(seg.feat, REPEAT_TOL)
+        flags = (np.asarray(neigh) - 1) >= p.repeat_group
+        out = np.concatenate([[False], flags])[seg.lab]
+    cache[key] = out
+    return out
+
+
+def detect(res: AnalysisResult, p: Optional[DetectParams] = None) -> Detection:
+    p = p or DetectParams()
+    H, W = res.shape
+    T = threshold_from_sensitivity(p.sensitivity)
+    seg = _segment(res, p, T, p.min_area)
+    if seg.n == 0:
+        return Detection([], np.zeros((H, W), np.int32), seg.score, T, res.scale, res.orig_size,
+                         n_small=seg.n_small)
+    n = seg.n
+
+    repeated = np.zeros(n, bool)
+    if p.repeat_filter:
+        rmap = _repeat_map(res, p)
+        if rmap is not None:
+            repeated = rmap[seg.peak_pos[:, 0], seg.peak_pos[:, 1]]
     n_rep = int(repeated.sum())
 
-    order = [i for i in np.argsort(-peak) if not repeated[i]]
+    order = [i for i in np.argsort(-seg.peak) if not repeated[i]]
     n_found = len(order)
     order = order[:max(1, p.max_regions)]
 
     regions: List[Region] = []
-    final = np.zeros((H, W), np.int32)
     rank_of = np.zeros(n + 1, np.int32)
+    s = res.scale
     for rank, i in enumerate(order, start=1):
         rank_of[i + 1] = rank
-        sl = objs[i]
+        sl = seg.objs[i]
         y0, y1, x0, x1 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
-        sh = np.array([mc[i], ms[i], mt[i]], float)
-        tot = sh.sum()
+        sh = seg.shares[i]
+        tot = float(sh.sum())
         shf = tuple(float(v) for v in (sh / tot if tot > 0 else sh))
-        s = res.scale
-        ox0, oy0 = int(math.floor(x0 * s)), int(math.floor(y0 * s))
-        ox1 = min(res.orig_size[0], int(math.ceil(x1 * s)))
-        oy1 = min(res.orig_size[1], int(math.ceil(y1 * s)))
         regions.append(Region(
-            id=rank, x0=ox0, y0=oy0, x1=ox1, y1=oy1,
-            cx=float((com[i, 1] + 0.5) * s), cy=float((com[i, 0] + 0.5) * s),
-            area=int(area[i]), area_orig=int(round(area[i] * s * s)),
-            score=float(peak[i]), mean_score=float(mean[i]),
+            id=rank,
+            x0=int(math.floor(x0 * s)), y0=int(math.floor(y0 * s)),
+            x1=min(res.orig_size[0], int(math.ceil(x1 * s))), y1=min(res.orig_size[1], int(math.ceil(y1 * s))),
+            cx=float((seg.com[i, 1] + 0.5) * s), cy=float((seg.com[i, 0] + 0.5) * s),
+            area=int(seg.area[i]), area_orig=int(round(seg.area[i] * s * s)),
+            score=float(seg.peak[i]), mean_score=float(seg.mean[i]),
             reason=REASONS[int(np.argmax(sh))] if tot > 0 else REASONS[0],
             share=shf,
-            rgb=tuple(int(round(v)) for v in rgbm[i]),
+            rgb=tuple(int(round(v)) for v in seg.rgbm[i]),
         ))
-    final = rank_of[lab_img]
-    return Detection(regions=regions, label_image=final, score=score, threshold=T,
+    return Detection(regions=regions, label_image=rank_of[seg.lab], score=seg.score, threshold=T,
                      scale=res.scale, orig_size=res.orig_size,
-                     n_found=n_found, n_repeated=n_rep, n_small=max(n_small, 0))
+                     n_found=n_found, n_repeated=n_rep, n_small=seg.n_small)
 
 
 # --------------------------------------------------------------------------
